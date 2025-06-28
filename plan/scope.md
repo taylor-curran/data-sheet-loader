@@ -78,3 +78,11 @@ Rather than tree-first or integrated approaches, use a section-by-section iterat
 - **Quality Validation**: Structure validation, content completeness checks, cross-reference preservation
 - **Testing Strategy**: Ground truth creation, iterative prompt refinement
 - **Security**: Data privacy, API data handling, proprietary content protection
+
+## Important docs:
+
+- [Responses vs. Chat Completions](https://platform.openai.com/docs/guides/responses-vs-chat-completions) so coding agent doesn't get confused with old knowledge
+- [Quickstart](https://platform.openai.com/docs/quickstart?api-mode=responses) for using the API
+- [PDF Files](https://platform.openai.com/docs/guides/pdf-files?api-mode=responses#page-top) for PDF file handling
+- [Conversation State](https://platform.openai.com/docs/guides/conversation-state?api-mode=responses) for maintaining state across iterative section processing
+
