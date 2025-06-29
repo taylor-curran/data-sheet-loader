@@ -5,71 +5,113 @@
 import json
 import pdfplumber
 from openai import OpenAI
-from utils import print_section
+from utils import (
+    print_section,
+    create_json_structure_artifact,
+    create_headers_table_artifact,
+    create_content_summary_artifact,
+    create_processing_summary_artifact,
+)
+from prompts import get_file_tree_prompt, get_refinement_prompt
 from prefect import flow, task
 from prefect.cache_policies import INPUTS, TASK_SOURCE
+from datetime import timedelta
+
 client = OpenAI()
 
+
 @task
-def extract_headers_and_summary(pdf_path, max_pages=5):
+def extract_headers_and_summary_with_pdfplumber(pdf_path, max_pages=5):
     """Extract headers and basic content summary using pdfplumber"""
-    print_section("PDFPLUMBER EXTRACTION STARTING", f"Processing: {pdf_path}")
-    
+    # Minimal logging for task start
+    print(f"Extracting headers from: {pdf_path}")
+
     headers = []
     content_summary = []
-    
+
     with pdfplumber.open(pdf_path) as pdf:
         total_pages = len(pdf.pages)
-        print(f"Total pages: {total_pages}")
-        
+        print(
+            f"Processing {min(max_pages if max_pages not in [None, -1] else total_pages, total_pages)} of {total_pages} pages"
+        )
+
         # Handle max_pages = None or -1 for entire file
         if max_pages is None or max_pages == -1:
             pages_to_process = pdf.pages
-            print(f"Processing ALL {total_pages} pages")
+            processed_count = total_pages
         else:
             pages_to_process = pdf.pages[:max_pages]
-            print(f"Processing first {min(max_pages, total_pages)} pages")
-        
+            processed_count = min(max_pages, total_pages)
+
         for page_num, page in enumerate(pages_to_process):
-            print(f"\nProcessing page {page_num + 1}...")
-            
+            # Minimal progress logging
+            if page_num % 5 == 0:  # Log every 5th page
+                print(f"Processing page {page_num + 1}...")
+
             text = page.extract_text()
             if text:
-                lines = text.split('\n')
-                
+                lines = text.split("\n")
+
                 # Simple header detection (lines that are short, uppercase, or numbered)
                 for line in lines:
                     line = line.strip()
                     if line and (
-                        len(line) < 50 and 
-                        (line.isupper() or 
-                         any(line.startswith(str(i)) for i in range(1, 20)) or
-                         line.count('.') >= 2)  # Likely section numbering
+                        len(line) < 50
+                        and (
+                            line.isupper()
+                            or any(line.startswith(str(i)) for i in range(1, 20))
+                            or line.count(".") >= 2
+                        )  # Likely section numbering
                     ):
                         headers.append(f"Page {page_num + 1}: {line}")
-                
+
                 # Extract first few meaningful lines as summary
-                meaningful_lines = [line.strip() for line in lines if len(line.strip()) > 20]
+                meaningful_lines = [
+                    line.strip() for line in lines if len(line.strip()) > 20
+                ]
                 if meaningful_lines:
-                    content_summary.append(f"Page {page_num + 1}: {meaningful_lines[0][:100]}...")
-    
+                    content_summary.append(
+                        f"Page {page_num + 1}: {meaningful_lines[0][:100]}..."
+                    )
+
+    # Create artifacts for the extracted data
+    create_headers_table_artifact(headers, "pdf-headers")
+    create_content_summary_artifact(content_summary, "pdf-content-summary")
+    create_processing_summary_artifact(
+        pdf_path, total_pages, processed_count, "pdf-processing-summary"
+    )
+
     return headers, content_summary
 
-@task(cache_policy=INPUTS + TASK_SOURCE)
-def generate_initial_tree_structure(file_id: str, file_tree_prompt: str, debug_mode: bool = True):
+
+@task(
+    cache_policy=INPUTS - "debug_mode",
+    cache_expiration=timedelta(hours=24),
+    persist_result=True,
+    refresh_cache=True,
+)
+def generate_initial_tree_structure_with_openai(
+    pdf_file_path: str, file_tree_prompt: str, debug_mode: bool = True
+):
     """Generate initial tree structure from PDF using OpenAI API.
-    
+
     Args:
-        file_id (str): OpenAI file ID for the uploaded PDF
+        pdf_file_path (str): Path to the PDF file
         file_tree_prompt (str): Prompt for tree structure generation
         debug_mode (bool): Whether to show detailed debug output
-        
+
     Returns:
         str: AI-generated tree structure
     """
     if debug_mode:
-        print_section("OPENAI TREE GENERATION TASK", f"Processing file ID: {file_id}")
-    
+        print(f"Uploading and processing PDF: {pdf_file_path}")
+
+    # Upload file to OpenAI (only happens on cache miss)
+    file = client.files.create(file=open(pdf_file_path, "rb"), purpose="user_data")
+
+    if debug_mode:
+        print(f"File uploaded successfully. ID: {file.id}")
+
     response = client.responses.create(
         model="gpt-4.1",
         input=[
@@ -78,7 +120,7 @@ def generate_initial_tree_structure(file_id: str, file_tree_prompt: str, debug_m
                 "content": [
                     {
                         "type": "input_file",
-                        "file_id": file_id,
+                        "file_id": file.id,
                     },
                     {
                         "type": "input_text",
@@ -88,38 +130,47 @@ def generate_initial_tree_structure(file_id: str, file_tree_prompt: str, debug_m
             }
         ],
     )
-    
+
     ai_tree_structure = response.output_text
+
+    # Create artifact for the AI-generated structure
+    create_json_structure_artifact(
+        json_content=ai_tree_structure,
+        title="AI-Generated File Structure",
+        key="ai-tree-structure",
+        description="Initial file structure generated by AI analysis of the datasheet PDF. This provides a comprehensive organization based on typical datasheet sections.",
+    )
+
     if debug_mode:
-        print_section("OPENAI TREE STRUCTURE RESULT", ai_tree_structure)
-    
+        print("AI tree structure generated and saved as artifact")
+
     return ai_tree_structure
 
-@task(cache_policy=INPUTS + TASK_SOURCE)
-def refine_tree_structure(ai_structure: str, headers: list, debug_mode: bool = True):
-    """Refine tree structure based on AI structure and extracted headers.
-    
+
+@task(
+    cache_policy=INPUTS - "debug_mode",
+    cache_expiration=timedelta(hours=24),
+    persist_result=True,
+)
+def refine_tree_structure_with_openai(
+    ai_structure: str, headers: list, content_summary: list, debug_mode: bool = True
+):
+    """Refine tree structure based on AI structure and extracted PDF content.
+
     Args:
         ai_structure (str): Initial AI-generated structure
         headers (list): List of extracted headers from PDF
+        content_summary (list): List of content summaries from PDF pages
         debug_mode (bool): Whether to show detailed debug output
-        
+
     Returns:
         str: Refined tree structure
     """
     if debug_mode:
-        print_section("STRUCTURE REFINEMENT TASK", "Refining structure based on headers...")
-    
-    refine_prompt = f"""Based on the AI-generated structure and the extracted headers, suggest improvements.
+        print("Refining structure based on extracted headers...")
 
-AI Structure:
-{ai_structure}
+    refine_prompt = get_refinement_prompt(ai_structure, headers, content_summary)
 
-Extracted Headers:
-{chr(10).join(headers[:20])}  # First 20 headers
-
-Provide a refined JSON structure that combines the best of both approaches."""
-    
     refinement_response = client.responses.create(
         model="gpt-4.1",
         input=[
@@ -134,92 +185,87 @@ Provide a refined JSON structure that combines the best of both approaches."""
             }
         ],
     )
-    
+
     refined_structure = refinement_response.output_text
+
+    # Create artifact for the refined structure
+    create_json_structure_artifact(
+        json_content=refined_structure,
+        title="Refined File Structure",
+        key="refined-tree-structure",
+        description="Final refined file structure that combines AI analysis with extracted PDF headers. This represents the optimal organization for the datasheet content.",
+    )
+
     if debug_mode:
-        print_section("FINAL REFINED STRUCTURE", refined_structure)
-    
+        print("Refined structure generated and saved as artifact")
+
     return refined_structure
+
 
 @flow
 def load_pdf(pdf_file_path, max_pages=5, debug_mode=True):
     """Main function to process PDF and generate file tree structure
-    
+
     Args:
         pdf_file_path (str): Path to the PDF file
         max_pages (int or None): Number of pages to process. Use None or -1 for entire file
         debug_mode (bool): Whether to show detailed debug output
     """
-    
-    pages_desc = "entire file" if (max_pages is None or max_pages == -1) else f"{max_pages} pages"
-    if debug_mode:
-        print_section("STARTING PDF PROCESSING", f"File: {pdf_file_path}\nProcessing: {pages_desc}")
-    
-    # Step 1: Enhanced tree generation prompt
-    file_tree_prompt = """Analyze this datasheet and create a simple directory/file structure for organizing its content.
 
-Return a JSON structure with file and directory names that would organize this datasheet's content logically.
-Keep names short and descriptive. Focus on major sections like overview, specifications, pinout, registers, etc.
-
-Format as valid JSON with nested structure showing directories and files.
-Example format:
-{
-  "overview": {
-    "description.md": null,
-    "features.md": null
-  },
-  "specifications": {
-    "electrical.md": null,
-    "mechanical.md": null
-  }
-}"""
-
-    if debug_mode:
-        print_section("STEP 1: FILE UPLOAD", "Uploading PDF to OpenAI...")
-
-    # Upload file to OpenAI
-    file = client.files.create(
-        file=open(pdf_file_path, "rb"), purpose="user_data"
+    pages_desc = (
+        "entire file"
+        if (max_pages is None or max_pages == -1)
+        else f"{max_pages} pages"
     )
-
     if debug_mode:
-        print(f"File ID: {file.id}")
+        print(f"Starting PDF processing: {pdf_file_path} ({pages_desc})")
+
+    # Step 1: Get tree generation prompt
+    file_tree_prompt = get_file_tree_prompt()
 
     # Step 1: Generate initial tree structure (cached task)
-    ai_tree_structure = generate_initial_tree_structure(
-        file_id=file.id,
+    ai_tree_structure = generate_initial_tree_structure_with_openai(
+        pdf_file_path=pdf_file_path,
         file_tree_prompt=file_tree_prompt,
-        debug_mode=debug_mode
+        debug_mode=debug_mode,
     )
 
     # Step 2: Extract headers and content using pdfplumber
-    headers, content_summary = extract_headers_and_summary(pdf_file_path, max_pages)
-
-    if debug_mode:
-        print_section("STEP 2: PDFPLUMBER HEADERS", "\n".join(headers))
-        print_section("STEP 2: PDFPLUMBER CONTENT SUMMARY", "\n".join(content_summary))
-
-    # Step 3: Refine structure (cached task)
-    refined_structure = refine_tree_structure(
-        ai_structure=ai_tree_structure,
-        headers=headers,
-        debug_mode=debug_mode
+    headers, content_summary = extract_headers_and_summary_with_pdfplumber(
+        pdf_file_path, max_pages
     )
 
     if debug_mode:
-        print_section("PROCESS COMPLETE", "Tree generation and header extraction finished!")
-    
+        print(
+            f"Extracted {len(headers)} headers and {len(content_summary)} content summaries"
+        )
+
+    # Step 3: Refine structure (cached task)
+    refined_structure = refine_tree_structure_with_openai(
+        ai_structure=ai_tree_structure,
+        headers=headers,
+        content_summary=content_summary,
+        debug_mode=debug_mode,
+    )
+
+    if debug_mode:
+        print("PDF processing workflow completed successfully!")
+        print(
+            "Check the Prefect UI for detailed artifacts with the generated structures and extracted data."
+        )
+
     return {
         "ai_structure": ai_tree_structure,
         "headers": headers,
         "content_summary": content_summary,
-        "refined_structure": refined_structure
+        "refined_structure": refined_structure,
     }
+
 
 if __name__ == "__main__":
     # Configuration
     PDF_FILE_PATH = "example_data_sheets/BST-BMP280-DS001-11.pdf"
-    
+
     # Run the PDF processing
     # Use max_pages=None or max_pages=-1 to process entire file
     result = load_pdf(PDF_FILE_PATH, max_pages=5, debug_mode=True)
